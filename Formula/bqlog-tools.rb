@@ -1,5 +1,5 @@
 class BqlogTools < Formula
-  desc "Command line tools for BqLog log files"
+  desc "Command-line tools for BqLog log files"
   homepage "https://github.com/Tencent/BqLog"
   url "https://github.com/Tencent/BqLog/archive/refs/tags/Release_2.7.0.tar.gz"
   sha256 "aed63a3e5b38b35bdb10d6f1eef134e727af4b5e63ead165c5817f4271dd3517"
