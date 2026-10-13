@@ -7,14 +7,19 @@
 
 ## formula 装了什么
 
-| formula | 内容 |
+只有一个 formula，`brew install bqlog` 就覆盖了全部用法：
+
+| | 内容 |
 |---|---|
-| `bqlog` | 公开头文件（含 C++20 模块接口单元 `bq_log/bq.log.cppm`）、静态库、动态库、`BqLogConfig.cmake` 与 `bqlog.pc` |
-| `bqlog-tools` | `BqLog_CategoryLogGenerator` 与 `BqLog_LogDecoder` |
+| 库 | `libBqLog.a` 与 `libBqLog.dylib`（两种形态），导出为 `bqlog::BqLogShared` 与 `bqlog::BqLogStatic` |
+| 头文件 | `include/bq_log/` 与 `include/bq_common/`，含 C++20 模块接口单元 `bq_log/bq.log.cppm` |
+| 包发现 | `BqLogConfig.cmake` 与 `bqlog.pc` |
+| 命令行工具 | `BqLog_CategoryLogGenerator` 与 `BqLog_LogDecoder`，装在 `bin/` |
 
-工具把库源码直接编进可执行文件，所以 `bqlog-tools` 不依赖 `bqlog`。
+工具会把库源码编进可执行文件，放在同一个 formula 里只多几秒编译；若拆成第二个 formula，等于
+为两个小命令把整个库再编一遍。
 
-两者都从源码构建，本次不发布 bottle，因此 `brew install` 会现场编译。
+从源码构建，本次不发布 bottle，因此 `brew install` 会现场编译。
 
 ## 覆盖平台
 
@@ -36,7 +41,7 @@ cp -r pack/homebrew/Formula "$(brew --repository)/Library/Taps/pippocao/homebrew
 
 ```bash
 brew tap pippocao/bqlog
-brew install bqlog bqlog-tools
+brew install bqlog
 ```
 
 ## 发新版本时更新 formula
@@ -86,11 +91,11 @@ brew test bqlog
 向上游提交之前：
 
 - Release tag 必须存在于本仓库；他们的 CI 从 tag 构建，不从 fork 构建。
-- `livecheck` 必须能解析出结果，这也是两个 formula 都覆盖默认值的原因：tag 是
-  `Release_<版本>`，不是 Homebrew 默认假设的 `v<版本>`。不覆盖的话 audit 会失败，自动 bump
-  机器人也永远发现不了新版本。
-- 只提交 `bqlog` 库。`bqlog-tools` 会把库源码编进可执行文件，提交它等于为两个小命令多跑一倍
-  构建，它留在 tap 里。
+- `livecheck` 必须能解析出结果，这也是 formula 覆盖默认值的原因：tag 是 `Release_<版本>`，
+  不是 Homebrew 默认假设的 `v<版本>`。不覆盖的话 audit 会失败，自动 bump 机器人也永远发现不了
+  新版本。
+- formula 同时提供命令行工具与库，一次安装覆盖两类使用者。工具只多几秒编译，比另开一个
+  formula（为两个小命令把整个库再编一遍）划算。
 
 官方合入的 formula 不能像 tap 那样撤回 —— 移除要先 deprecate 再 disable。验证请用
 `brew audit` 与 `brew test-bot`，不要用真实 PR 去试。
@@ -124,11 +129,10 @@ target_sources(app PRIVATE FILE_SET CXX_MODULES
 target_link_libraries(app PRIVATE bqlog::BqLogShared)
 ```
 
-这需要 CMake 3.28 或更新版本，以及模块依赖扫描可用的编译器（`clang-scan-deps`）。Apple clang
-根本没有实现 C++20 的模块语法：实测 Apple clang 17.0.0（Xcode 26）下，单独一句
-`export module foo;` 都无法解析，`-fmodules`、`-fcxx-modules`、`-fmodules-ts` 也改变不了。
-所以 macOS 上要走模块入口必须使用上游 LLVM：`brew install llvm`，并用 keg-only 的 `clang++`
-构建。include 入口与库的其余部分照常用 Apple clang 构建即可。
+这需要 CMake 3.28 或更新版本，以及一个真正实现 C++20 模块、且模块依赖扫描可用的编译器
+（`clang-scan-deps`）。这是硬性要求：如果编译器接受 `-std=c++20` 却解析不了 `export module`，
+它会在接口单元上直接报错，而不是跳过。include 入口没有这个要求——库的其余部分用任何受支持的
+编译器构建即可。
 
 两点约束，见[集成指南](../../docs/INTEGRATION_GUIDE_CHS.md)：
 

@@ -6,17 +6,22 @@ The formulas and the bump script for the `pippocao/homebrew-bqlog` tap. The tap 
 holds copies; this directory is the reviewable source of truth, so a formula change is
 reviewed together with the code it packages.
 
-## What the formulas install
+## What the formula installs
 
-| Formula | Contents |
+One formula, so `brew install bqlog` covers every use:
+
+| | Contents |
 |---|---|
-| `bqlog` | Public headers (including the C++20 module interface unit `bq_log/bq.log.cppm`), the static library, the shared library, `BqLogConfig.cmake` and `bqlog.pc` |
-| `bqlog-tools` | `BqLog_CategoryLogGenerator` and `BqLog_LogDecoder` |
+| Libraries | `libBqLog.a` and `libBqLog.dylib` (both forms), exported as `bqlog::BqLogShared` and `bqlog::BqLogStatic` |
+| Headers | `include/bq_log/` and `include/bq_common/`, including the C++20 module interface unit `bq_log/bq.log.cppm` |
+| Package discovery | `BqLogConfig.cmake` and `bqlog.pc` |
+| Command line tools | `BqLog_CategoryLogGenerator` and `BqLog_LogDecoder`, in `bin/` |
 
-The tools compile the library sources into their executables, so `bqlog-tools` does not
-depend on `bqlog`.
+The tools compile the library sources into their executables, which costs a few seconds inside
+this formula — far less than a second formula that would rebuild the whole library for two small
+commands.
 
-Both build from source; no bottle is published, so `brew install` compiles the library.
+It builds from source; no bottle is published, so `brew install` compiles the library.
 
 ## Platforms
 
@@ -38,7 +43,7 @@ Then commit and push the tap repository.
 
 ```bash
 brew tap pippocao/bqlog
-brew install bqlog bqlog-tools
+brew install bqlog
 ```
 
 ## Updating the formulas for a new release
@@ -95,12 +100,12 @@ Before proposing the formula upstream:
 
 - the release tag has to exist in this repository; their CI builds from it and never from a
   fork;
-- `livecheck` has to resolve, which is why both formulas override the default: the tag is
+- `livecheck` has to resolve, which is why the formula overrides the default: the tag is
   `Release_<version>` rather than the `v<version>` Homebrew assumes. Without the override the
   audit fails and the autobump bot never notices a new release;
-- only the `bqlog` library is proposed. `bqlog-tools` compiles the library sources into its
-  executables, so proposing it would double the build for two small commands; it stays in the
-  tap.
+- the formula carries the command line tools as well as the library, so one install serves both
+  kinds of user. They add a few seconds of compilation rather than a second formula, which would
+  rebuild the whole library for two small commands.
 
 A merged formula cannot be withdrawn the way a tap can — removal means deprecating it and then
 disabling it. Verify with `brew audit` and `brew test-bot`, never with a pull request.
@@ -134,12 +139,11 @@ target_sources(app PRIVATE FILE_SET CXX_MODULES
 target_link_libraries(app PRIVATE bqlog::BqLogShared)
 ```
 
-This needs CMake 3.28 or newer and a compiler whose module dependency scanning works
-(`clang-scan-deps`). Apple clang does not implement the C++20 module syntax at all: measured on
-Apple clang 17.0.0 (Xcode 26), `export module foo;` on its own fails to parse, and `-fmodules`,
-`-fcxx-modules` and `-fmodules-ts` change nothing. On macOS the module entry therefore needs
-upstream LLVM — `brew install llvm` and build with the keg-only `clang++`. The include entry and
-the rest of the library build with Apple clang as usual.
+This needs CMake 3.28 or newer and a toolchain that implements C++20 modules and whose module
+dependency scanning works (`clang-scan-deps`). That is a hard requirement: a compiler that
+accepts `-std=c++20` but cannot parse `export module` fails on the interface unit instead of
+skipping it. The include entry has no such requirement — the rest of the library builds with any
+supported compiler.
 
 Two constraints, from [the integration guide](../../docs/INTEGRATION_GUIDE.md):
 
