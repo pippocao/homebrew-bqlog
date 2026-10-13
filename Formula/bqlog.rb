@@ -16,7 +16,8 @@ class Bqlog < Formula
   depends_on "cmake" => :build
 
   def install
-    args = ["-DBUILD_LIB_TYPE=both", "-DBQ_BUILD_TOOLS=OFF", "-DBQ_WERROR=OFF"]
+    # Both library forms and the command line tools, so a single install covers every use.
+    args = ["-DBUILD_LIB_TYPE=both", "-DBQ_BUILD_TOOLS=ON", "-DBQ_WERROR=OFF"]
     # A package manager installs for the native architecture, not a universal binary.
     args << "-DCMAKE_OSX_ARCHITECTURES=#{Hardware::CPU.arch}" if OS.mac?
 
@@ -39,5 +40,8 @@ class Bqlog < Formula
            "-I#{include}", "-L#{lib}", "-lBqLog", "-Wl,-rpath,#{lib}",
            "-o", "test"
     system "./test"
+
+    assert_predicate bin/"BqLog_CategoryLogGenerator", :executable?
+    assert_predicate bin/"BqLog_LogDecoder", :executable?
   end
 end
