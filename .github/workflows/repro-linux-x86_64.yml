@@ -1,0 +1,148 @@
+name: Repro - homebrew-core Linux x86_64 failure
+
+# Reproduces the `Test formulae` step of the homebrew-core CI for the bqlog formula in the
+# same container. Every brew step is time bounded (timeout) so the job always finishes and
+# uploads its logs, and a background monitor records memory, disk and processes every 20 s.
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  repro:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    container:
+      image: ghcr.io/homebrew/brew:main
+      options: --init --user linuxbrew
+    defaults:
+      run:
+        working-directory: /github/home
+        shell: /bin/bash -xeuo pipefail {0}
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: 1
+      HOMEBREW_NO_ANALYTICS: 1
+      HOMEBREW_NO_ENV_HINTS: 1
+    steps:
+      - name: Environment
+        run: |
+          uname -a
+          echo "cpus: $(nproc)"
+          free -m
+          df -h / /github 2>/dev/null || true
+          brew --version
+
+      - name: Put the formula in a tap
+        run: |
+          brew tap-new --no-git bqlog/ci
+          cat >"$(brew --repository)/Library/Taps/bqlog/homebrew-ci/Formula/bqlog.rb" <<'FORMULA_EOF'
+          class Bqlog < Formula
+            desc "Lightweight, high-performance, cross-language logging library"
+            homepage "https://github.com/Tencent/BqLog"
+            # Placeholders: the release workflow and bump.sh write the url and sha256 of the new tag here.
+            # An unfilled formula fails to fetch on purpose.
+            url "https://github.com/Tencent/BqLog/archive/refs/tags/Release_2.7.0.tar.gz"
+            sha256 "0edb9fd3ba80fd286958317848cbd10795aea9c273f88c80a6fe8903afc01de5"
+            license "Apache-2.0"
+
+            head "https://github.com/Tencent/BqLog.git", branch: "main"
+
+            livecheck do
+              url :stable
+              regex(/^Release[._-]v?(\d+(?:\.\d+)+)$/i)
+            end
+
+            depends_on "cmake" => :build
+
+            deny_network_access!
+
+            def install
+              args = ["-DBUILD_LIB_TYPE=both", "-DBQ_BUILD_TOOLS=ON", "-DBQ_WERROR=OFF"]
+              args << "-DCMAKE_OSX_ARCHITECTURES=#{Hardware::CPU.arch}" if OS.mac?
+
+              system "cmake", "-S", ".", "-B", "build", *std_cmake_args, *args
+              system "cmake", "--build", "build", "--parallel"
+              system "cmake", "--install", "build"
+            end
+
+            test do
+              (testpath/"test.cpp").write <<~'CPP'
+                #include <bq_log/bq_log.h>
+
+                int main() {
+                    // create_log rejects a config without an appenders_config object, so name one.
+                    bq::log log = bq::log::create_log("homebrew_test",
+                        "appenders_config.console.type=console\n"
+                        "appenders_config.console.levels=[all]");
+                    if (!log.is_valid()) {
+                        return 1;
+                    }
+                    log.info("bqlog installed and linked");
+                    log.force_flush();
+                    return 0;
+                }
+              CPP
+              system ENV.cxx, "test.cpp", "-std=c++17",
+                     "-I#{include}", "-L#{lib}", "-lBqLog", "-Wl,-rpath,#{lib}",
+                     "-o", "test"
+              system "./test"
+
+              assert_predicate bin/"BqLog_CategoryLogGenerator", :executable?
+              assert_predicate bin/"BqLog_LogDecoder", :executable?
+            end
+          end
+          FORMULA_EOF
+          brew info bqlog/ci/bqlog
+
+      - name: Start the resource monitor
+        run: |
+          nohup bash -c '
+            while true; do
+              echo "==== $(date -Is)"
+              uptime
+              free -m | sed -n 2p
+              df -h / /github 2>/dev/null | tail -n +2
+              ps -eo rss,pcpu,etime,comm --sort=-rss | head -8
+              echo "processes: $(ps -e --no-headers | wc -l)"
+              sleep 20
+            done' >"$HOME/monitor.log" 2>&1 &
+          sleep 2
+          echo "monitor started"
+
+      - name: brew install --only-dependencies
+        continue-on-error: true
+        run: timeout -k 30 300 brew install --only-dependencies --verbose --formula bqlog/ci/bqlog
+
+      - name: brew install --build-bottle
+        continue-on-error: true
+        run: timeout -k 30 600 brew install --verbose --formula --build-bottle bqlog/ci/bqlog
+
+      - name: brew bottle
+        continue-on-error: true
+        run: timeout -k 30 180 brew bottle --verbose --json bqlog/ci/bqlog
+
+      - name: install the bottle and check linkage
+        continue-on-error: true
+        run: |
+          timeout -k 30 120 brew uninstall --formula --force --ignore-dependencies bqlog
+          timeout -k 30 180 brew install ./bqlog--2.7.0.x86_64_linux.bottle.tar.gz
+          timeout -k 30 120 brew linkage --test bqlog
+
+      - name: brew test
+        continue-on-error: true
+        run: timeout -k 30 300 brew test --verbose bqlog
+
+      - name: brew audit
+        continue-on-error: true
+        run: timeout -k 30 300 brew audit --formula bqlog/ci/bqlog --online --new
+
+      - name: Resource monitor log
+        if: always()
+        run: tail -n 200 "$HOME/monitor.log"
+
+      - name: Upload the monitor log
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v6
+        with:
+          name: monitor-log
+          path: /github/home/monitor.log
