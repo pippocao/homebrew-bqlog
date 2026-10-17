@@ -1,9 +1,8 @@
 name: Repro - homebrew-core Linux x86_64 hang
 
-# The homebrew-core CI `Test formulae` step hangs on Linux x86_64 for the bqlog formula.
-# `brew install --build-bottle` itself reproduces it here. The build runs in the background
-# with its output in a file, and a foreground loop prints where it is every 30 s, so the job
-# always finishes and its logs survive.
+# The build hangs on Linux x86_64. Run it in the background writing to build.log and poll from
+# the foreground; the step itself has a hard timeout-minutes so GitHub cuts it even if orphaned
+# children keep the pipe open, which is what stops the usual `timeout` from freeing the step.
 on:
   push:
   workflow_dispatch:
@@ -11,7 +10,7 @@ on:
 jobs:
   repro:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 35
     container:
       image: ghcr.io/homebrew/brew:main
       options: --init --user linuxbrew
@@ -27,9 +26,8 @@ jobs:
     steps:
       - name: Environment
         run: |
-          echo "HOME=$HOME"; ls -ld "$HOME"; mkdir -p "$HOME/.homebrew"
-          uname -m; echo "cpus: $(nproc)"; free -m | sed -n 2p; df -h / | tail -1
-          brew --version
+          echo "HOME=$HOME"; mkdir -p "$HOME/.homebrew"; uname -m
+          echo "cpus: $(nproc)"; free -m | sed -n 2p; brew --version
 
       - name: Put the formula in a tap
         run: |
@@ -96,39 +94,46 @@ jobs:
       - name: Install the build dependencies
         run: timeout -k 30 240 brew install --only-dependencies --verbose --formula --build-bottle bqlog/ci/bqlog
 
-      - name: Build in the background and watch where it gets stuck
+      - name: Build in the background and watch it
+        # Hard stop: GitHub kills the step even if the detached build still holds the output pipe.
+        timeout-minutes: 14
+        continue-on-error: true
         run: |
-          rm -f build.log build.rc
-          setsid nohup bash -c 'brew install --verbose --formula --build-bottle bqlog/ci/bqlog >/home/linuxbrew/build.log 2>&1; echo $? >/home/linuxbrew/build.rc' >/dev/null 2>&1 </dev/null &
-          sleep 5
-          for i in $(seq 1 24); do
+          : > build.log
+          set -m
+          brew install --verbose --formula --build-bottle bqlog/ci/bqlog >build.log 2>&1 &
+          bg=$!
+          for i in $(seq 1 22); do
             sleep 30
             echo "======================= elapsed $((i * 30))s"
-            if [ -f build.rc ]; then
-              echo "BUILD FINISHED with exit code $(cat build.rc)"
-              break
-            fi
-            echo "--- build.log: $(wc -l < build.log) lines, last 10:"
-            tail -n 10 build.log
+            echo "--- build.log: $(wc -l < build.log) lines, last 12:"
+            tail -n 12 build.log
             echo "--- busiest processes:"
-            ps -eo rss,pcpu,stat,wchan:22,etime,comm --sort=-pcpu | head -10
-            echo "--- memory: $(free -m | sed -n 2p)"
-            echo "--- disk:   $(df -h / | tail -1)"
+            ps -eo rss,pcpu,stat,wchan:22,etime,comm --sort=-pcpu | head -12
+            echo "--- memory: $(free -m | sed -n 2p)   disk: $(df -h / | tail -1)"
           done
-          echo "======================= build.log tail (80 lines)"
-          tail -n 80 build.log
+          echo "======================= build.log tail (100 lines)"
+          tail -n 100 build.log
           echo "======================= process list"
           ps -eo pid,ppid,rss,pcpu,stat,wchan:22,etime,comm --sort=-rss | head -20
-          echo "======================= killing what is left so this job can finish"
-          pkill -9 -f 'cc1plus' || true
-          pkill -9 -f cmake || true
-          pkill -9 -f ninja || true
-          pkill -9 -f bqlog || true
-          sleep 3
-          echo "remaining: $(ps -e --no-headers | wc -l) processes"
+          echo "======================= killing the process group so this step can end"
+          kill -9 -"$bg" 2>/dev/null || true
+          wait "$bg" 2>/dev/null || true
+
+      - name: Show the captured build output
+        if: always()
+        timeout-minutes: 3
+        continue-on-error: true
+        run: |
+          echo "build.log: $(wc -l < build.log) lines"
+          echo "===== head 40"
+          head -n 40 build.log
+          echo "===== tail 120"
+          tail -n 120 build.log
 
       - name: Upload the build log
         if: always()
+        timeout-minutes: 5
         continue-on-error: true
         uses: actions/upload-artifact@v6
         with:
