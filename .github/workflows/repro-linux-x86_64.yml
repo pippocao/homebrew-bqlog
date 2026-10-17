@@ -1,8 +1,9 @@
-name: Repro - homebrew-core Linux x86_64 hang
+name: Repro - bqlog Linux x86_64 OOM
 
-# The build hangs on Linux x86_64. Run it in the background writing to build.log and poll from
-# the foreground; the step itself has a hard timeout-minutes so GitHub cuts it even if orphaned
-# children keep the pipe open, which is what stops the usual `timeout` from freeing the step.
+# The unbounded `cmake --build build --parallel` in the formula makes make run an unlimited
+# number of jobs and the 16 GB runner runs out of memory: it was at 15.1 GB used after 30 s and
+# then the process was SIGKILLed (exit 137), taking the runner down with it. Build with a bounded
+# number of jobs and watch the memory profile.
 on:
   push:
   workflow_dispatch:
@@ -11,6 +12,10 @@ jobs:
   repro:
     runs-on: ubuntu-latest
     timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        parallel: ["4", "2"]
     container:
       image: ghcr.io/homebrew/brew:main
       options: --init --user linuxbrew
@@ -26,110 +31,109 @@ jobs:
     steps:
       - name: Environment
         run: |
-          echo "HOME=$HOME"; mkdir -p "$HOME/.homebrew"; uname -m
+          echo "HOME=$HOME"; mkdir -p "$HOME/.homebrew"
           echo "cpus: $(nproc)"; free -m | sed -n 2p; brew --version
 
-      - name: Put the formula in a tap
+      - name: Put a formula with a bounded parallel build in a tap
         run: |
           brew tap-new --no-git bqlog/ci
           cat >"$(brew --repository)/Library/Taps/bqlog/homebrew-ci/Formula/bqlog.rb" <<'FORMULA_EOF'
-          class Bqlog < Formula
-            desc "Lightweight, high-performance, cross-language logging library"
-            homepage "https://github.com/Tencent/BqLog"
-            # Placeholders: the release workflow and bump.sh write the url and sha256 of the new tag here.
-            # An unfilled formula fails to fetch on purpose.
-            url "https://github.com/Tencent/BqLog/archive/refs/tags/Release_2.7.0.tar.gz"
-            sha256 "0edb9fd3ba80fd286958317848cbd10795aea9c273f88c80a6fe8903afc01de5"
-            license "Apache-2.0"
+            class Bqlog < Formula
+              desc "Lightweight, high-performance, cross-language logging library"
+              homepage "https://github.com/Tencent/BqLog"
+              # Placeholders: the release workflow and bump.sh write the url and sha256 of the new tag here.
+              # An unfilled formula fails to fetch on purpose.
+              url "https://github.com/Tencent/BqLog/archive/refs/tags/Release_2.7.0.tar.gz"
+              sha256 "0edb9fd3ba80fd286958317848cbd10795aea9c273f88c80a6fe8903afc01de5"
+              license "Apache-2.0"
 
-            head "https://github.com/Tencent/BqLog.git", branch: "main"
+              head "https://github.com/Tencent/BqLog.git", branch: "main"
 
-            livecheck do
-              url :stable
-              regex(/^Release[._-]v?(\d+(?:\.\d+)+)$/i)
+              livecheck do
+                url :stable
+                regex(/^Release[._-]v?(\d+(?:\.\d+)+)$/i)
+              end
+
+              depends_on "cmake" => :build
+
+              deny_network_access!
+
+              def install
+                args = ["-DBUILD_LIB_TYPE=both", "-DBQ_BUILD_TOOLS=ON", "-DBQ_WERROR=OFF"]
+                args << "-DCMAKE_OSX_ARCHITECTURES=#{Hardware::CPU.arch}" if OS.mac?
+
+                system "cmake", "-S", ".", "-B", "build", *std_cmake_args, *args
+                system "cmake", "--build", "build", "--parallel", "PARALLEL_PLACEHOLDER"
+                system "cmake", "--install", "build"
+              end
+
+              test do
+                (testpath/"test.cpp").write <<~'CPP'
+                  #include <bq_log/bq_log.h>
+
+                  int main() {
+                      // create_log rejects a config without an appenders_config object, so name one.
+                      bq::log log = bq::log::create_log("homebrew_test",
+                          "appenders_config.console.type=console\n"
+                          "appenders_config.console.levels=[all]");
+                      if (!log.is_valid()) {
+                          return 1;
+                      }
+                      log.info("bqlog installed and linked");
+                      log.force_flush();
+                      return 0;
+                  }
+                CPP
+                system ENV.cxx, "test.cpp", "-std=c++17",
+                       "-I#{include}", "-L#{lib}", "-lBqLog", "-Wl,-rpath,#{lib}",
+                       "-o", "test"
+                system "./test"
+
+                assert_predicate bin/"BqLog_CategoryLogGenerator", :executable?
+                assert_predicate bin/"BqLog_LogDecoder", :executable?
+              end
             end
-
-            depends_on "cmake" => :build
-
-            deny_network_access!
-
-            def install
-              args = ["-DBUILD_LIB_TYPE=both", "-DBQ_BUILD_TOOLS=ON", "-DBQ_WERROR=OFF"]
-              args << "-DCMAKE_OSX_ARCHITECTURES=#{Hardware::CPU.arch}" if OS.mac?
-
-              system "cmake", "-S", ".", "-B", "build", *std_cmake_args, *args
-              system "cmake", "--build", "build", "--parallel"
-              system "cmake", "--install", "build"
-            end
-
-            test do
-              (testpath/"test.cpp").write <<~'CPP'
-                #include <bq_log/bq_log.h>
-
-                int main() {
-                    // create_log rejects a config without an appenders_config object, so name one.
-                    bq::log log = bq::log::create_log("homebrew_test",
-                        "appenders_config.console.type=console\n"
-                        "appenders_config.console.levels=[all]");
-                    if (!log.is_valid()) {
-                        return 1;
-                    }
-                    log.info("bqlog installed and linked");
-                    log.force_flush();
-                    return 0;
-                }
-              CPP
-              system ENV.cxx, "test.cpp", "-std=c++17",
-                     "-I#{include}", "-L#{lib}", "-lBqLog", "-Wl,-rpath,#{lib}",
-                     "-o", "test"
-              system "./test"
-
-              assert_predicate bin/"BqLog_CategoryLogGenerator", :executable?
-              assert_predicate bin/"BqLog_LogDecoder", :executable?
-            end
-          end
           FORMULA_EOF
-          brew info bqlog/ci/bqlog
+          sed -i "s/PARALLEL_PLACEHOLDER/${{ matrix.parallel }}/" "$(brew --repository)/Library/Taps/bqlog/homebrew-ci/Formula/bqlog.rb"
+          grep -n 'parallel' "$(brew --repository)/Library/Taps/bqlog/homebrew-ci/Formula/bqlog.rb"
 
       - name: Install the build dependencies
         run: timeout -k 30 240 brew install --only-dependencies --verbose --formula --build-bottle bqlog/ci/bqlog
 
-      - name: Build in the background and watch it
-        # Hard stop: GitHub kills the step even if the detached build still holds the output pipe.
-        timeout-minutes: 14
+      - name: Build with --parallel ${{ matrix.parallel }} and watch memory
+        timeout-minutes: 20
         continue-on-error: true
         run: |
           : > build.log
           set -m
           brew install --verbose --formula --build-bottle bqlog/ci/bqlog >build.log 2>&1 &
           bg=$!
-          for i in $(seq 1 22); do
-            sleep 30
-            echo "======================= elapsed $((i * 30))s"
-            echo "--- build.log: $(wc -l < build.log) lines, last 12:"
-            tail -n 12 build.log
-            echo "--- busiest processes:"
-            ps -eo rss,pcpu,stat,wchan:22,etime,comm --sort=-pcpu | head -12
-            echo "--- memory: $(free -m | sed -n 2p)   disk: $(df -h / | tail -1)"
+          for i in $(seq 1 40); do
+            sleep 15
+            echo "=== elapsed $((i * 15))s | build.log $(wc -l < build.log) lines | procs $(ps -e --no-headers | wc -l) | cc1plus $(ps -C cc1plus --no-headers 2>/dev/null | wc -l)"
+            echo "    mem: $(free -m | sed -n 2p)"
+            echo "    cgroup: $(cat /sys/fs/cgroup/memory.current 2>/dev/null || cat /sys/fs/cgroup/memory/memory.usage_in_bytes 2>/dev/null || echo n/a)"
+            ps -eo rss,pcpu,etime,comm --sort=-rss | head -8 | sed 's/^/      /'
+            tail -n 2 build.log | sed 's/^/      /'
+            if ! kill -0 "$bg" 2>/dev/null; then
+              echo "=== build process finished"
+              break
+            fi
           done
-          echo "======================= build.log tail (100 lines)"
-          tail -n 100 build.log
-          echo "======================= process list"
-          ps -eo pid,ppid,rss,pcpu,stat,wchan:22,etime,comm --sort=-rss | head -20
-          echo "======================= killing the process group so this step can end"
+          echo "=== build.log tail (40 lines)"
+          tail -n 40 build.log
+          echo "=== killing the process group"
           kill -9 -"$bg" 2>/dev/null || true
           wait "$bg" 2>/dev/null || true
 
-      - name: Show the captured build output
+      - name: Show the result
         if: always()
         timeout-minutes: 3
         continue-on-error: true
         run: |
           echo "build.log: $(wc -l < build.log) lines"
-          echo "===== head 40"
-          head -n 40 build.log
-          echo "===== tail 120"
-          tail -n 120 build.log
+          echo "===== tail 60"
+          tail -n 60 build.log
 
       - name: Upload the build log
         if: always()
@@ -137,5 +141,5 @@ jobs:
         continue-on-error: true
         uses: actions/upload-artifact@v6
         with:
-          name: build-log
+          name: build-log-parallel-${{ matrix.parallel }}
           path: /home/linuxbrew/build.log
