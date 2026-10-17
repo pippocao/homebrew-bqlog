@@ -1,8 +1,9 @@
 name: Repro - homebrew-core Linux x86_64 failure
 
-# Reproduces the `Test formulae` step of the homebrew-core CI for the bqlog formula in the
-# same container. Every brew step is time bounded (timeout) so the job always finishes and
-# uploads its logs, and a background monitor records memory, disk and processes every 20 s.
+# Runs the same brew steps as `brew test-bot` on Linux x86_64 inside the container the
+# homebrew-core CI uses (ghcr.io/homebrew/brew:main). Every brew step is time bounded so the
+# job always finishes and its logs survive, and a background monitor records memory, disk and
+# processes every 20 s.
 on:
   push:
   workflow_dispatch:
@@ -16,19 +17,25 @@ jobs:
       options: --init --user linuxbrew
     defaults:
       run:
-        working-directory: /github/home
+        working-directory: /home/linuxbrew
         shell: /bin/bash -xeuo pipefail {0}
     env:
       HOMEBREW_NO_AUTO_UPDATE: 1
       HOMEBREW_NO_ANALYTICS: 1
       HOMEBREW_NO_ENV_HINTS: 1
+      HOME: /home/linuxbrew
     steps:
       - name: Environment
         run: |
-          uname -a
+          id
+          echo "HOME=$HOME"
+          ls -ld "$HOME"
+          mkdir -p "$HOME/.homebrew"
+          echo "homebrew state dir ok"
+          uname -m
           echo "cpus: $(nproc)"
-          free -m
-          df -h / /github 2>/dev/null || true
+          free -m | sed -n 2p
+          df -h / | tail -1
           brew --version
 
       - name: Put the formula in a tap
@@ -100,44 +107,86 @@ jobs:
               echo "==== $(date -Is)"
               uptime
               free -m | sed -n 2p
-              df -h / /github 2>/dev/null | tail -n +2
+              df -h / | tail -1
               ps -eo rss,pcpu,etime,comm --sort=-rss | head -8
               echo "processes: $(ps -e --no-headers | wc -l)"
               sleep 20
-            done' >"$HOME/monitor.log" 2>&1 &
-          sleep 2
-          echo "monitor started"
+            done' >/home/linuxbrew/monitor.log 2>&1 &
+          sleep 3
+          cat /home/linuxbrew/monitor.log
 
       - name: brew install --only-dependencies
         continue-on-error: true
-        run: timeout -k 30 300 brew install --only-dependencies --verbose --formula bqlog/ci/bqlog
+        run: |
+          rc=0
+          timeout -k 30 240 brew install --only-dependencies --verbose --formula --build-bottle bqlog/ci/bqlog || rc=$?
+          echo "::warning::exit code $rc"
+          exit $rc
 
       - name: brew install --build-bottle
         continue-on-error: true
-        run: timeout -k 30 600 brew install --verbose --formula --build-bottle bqlog/ci/bqlog
+        run: |
+          rc=0
+          timeout -k 30 600 brew install --verbose --formula --build-bottle bqlog/ci/bqlog || rc=$?
+          echo "::warning::exit code $rc"
+          exit $rc
 
-      - name: brew bottle
-        continue-on-error: true
-        run: timeout -k 30 180 brew bottle --verbose --json bqlog/ci/bqlog
-
-      - name: install the bottle and check linkage
+      - name: brew fetch --test
         continue-on-error: true
         run: |
-          timeout -k 30 120 brew uninstall --formula --force --ignore-dependencies bqlog
-          timeout -k 30 180 brew install ./bqlog--2.7.0.x86_64_linux.bottle.tar.gz
-          timeout -k 30 120 brew linkage --test bqlog
+          rc=0
+          timeout -k 30 180 brew fetch --formula --retry bqlog/ci/bqlog --test --build-bottle --force || rc=$?
+          echo "::warning::exit code $rc"
+          exit $rc
 
-      - name: brew test
+      - name: brew livecheck
         continue-on-error: true
-        run: timeout -k 30 300 brew test --verbose bqlog
+        run: |
+          rc=0
+          timeout -k 30 180 brew livecheck --autobump --formula --json --full-name bqlog/ci/bqlog || rc=$?
+          echo "::warning::exit code $rc"
+          exit $rc
+
+      - name: brew style
+        continue-on-error: true
+        run: |
+          rc=0
+          timeout -k 30 120 brew style --formula bqlog/ci/bqlog || rc=$?
+          echo "::warning::exit code $rc"
+          exit $rc
 
       - name: brew audit
         continue-on-error: true
-        run: timeout -k 30 300 brew audit --formula bqlog/ci/bqlog --online --new
+        run: |
+          rc=0
+          timeout -k 30 240 brew audit --formula bqlog/ci/bqlog --online --new || rc=$?
+          echo "::warning::exit code $rc"
+          exit $rc
+
+      - name: brew bottle, install the bottle, linkage
+        continue-on-error: true
+        run: |
+          rc=0
+          timeout -k 30 180 brew bottle --verbose --json bqlog/ci/bqlog || rc=$?
+          echo "::warning::bottle exit code $rc"
+          timeout -k 30 120 brew uninstall --formula --force --ignore-dependencies bqlog || true
+          timeout -k 30 180 brew install ./bqlog--2.7.0.x86_64_linux.bottle.tar.gz || rc=$?
+          echo "::warning::install bottle exit code $rc"
+          timeout -k 30 120 brew linkage --test bqlog || rc=$?
+          echo "::warning::linkage exit code $rc"
+          exit $rc
+
+      - name: brew test
+        continue-on-error: true
+        run: |
+          rc=0
+          timeout -k 30 240 brew test --verbose bqlog || rc=$?
+          echo "::warning::exit code $rc"
+          exit $rc
 
       - name: Resource monitor log
         if: always()
-        run: tail -n 200 "$HOME/monitor.log"
+        run: tail -n 300 /home/linuxbrew/monitor.log
 
       - name: Upload the monitor log
         if: always()
@@ -145,4 +194,4 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: monitor-log
-          path: /github/home/monitor.log
+          path: /home/linuxbrew/monitor.log
